@@ -1,0 +1,12 @@
+# QuantumChess: the image only needs the sources and the licence files
+*
+!src
+!scripts
+!Copying.txt
+!AUTHORS
+src/**/*.o
+src/*.nnue
+src/stockfish
+src/stockfish.exe
+src/stockfish-wrap
+src/stockfish-wrap.exe
