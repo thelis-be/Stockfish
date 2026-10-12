@@ -38,11 +38,15 @@
 #include "syzygy/tbprobe.h"
 #include "tt.h"
 #include "uci.h"
+#include "wrap.h"
 
 using std::string;
 
 namespace Stockfish {
 
+// QuantumChess: unqualified attack helpers (Attacks::) keep the standard
+// geometry and are only used for the NNUE threat features
+// (update_piece_threats() and castling paths). The game rules use Wrap::.
 using namespace Attacks;
 
 namespace Zobrist {
@@ -109,12 +113,14 @@ std::ostream& operator<<(std::ostream& os, const Position& pos) {
 // http://web.archive.org/web/20201107002606/https://marcelk.net/2013-04-06/paper/upcoming-rep-v2.pdf
 
 // First and second hash functions for indexing the cuckoo tables
-inline int H1(Key h) { return h & 0x1fff; }
-inline int H2(Key h) { return (h >> 16) & 0x1fff; }
+// QuantumChess: wrapped files give more reversible moves (about 4300 instead
+// of 3668), so the tables are twice as large to keep their load below one half.
+inline int H1(Key h) { return h & 0x3fff; }
+inline int H2(Key h) { return (h >> 16) & 0x3fff; }
 
 // Cuckoo tables with Zobrist hashes of valid reversible moves, and the moves themselves
-static std::array<Key, 8192>  cuckoo;
-static std::array<Move, 8192> cuckooMove;
+static std::array<Key, 16384>  cuckoo;
+static std::array<Move, 16384> cuckooMove;
 
 // Initializes at startup the various arrays used to compute hash keys
 void Position::init() {
@@ -144,7 +150,7 @@ void Position::init() {
     for (Piece pc : Pieces)
         for (Square s1 = SQ_A1; s1 <= SQ_H8; ++s1)
             for (Square s2 = Square(s1 + 1); s2 <= SQ_H8; ++s2)
-                if ((type_of(pc) != PAWN) && (attacks_bb(type_of(pc), s1, 0) & s2))
+                if ((type_of(pc) != PAWN) && (Wrap::attacks_bb(type_of(pc), s1, 0) & s2))
                 {
                     Move move = Move(s1, s2);
                     Key  key  = Zobrist::psq[pc][s1] ^ Zobrist::psq[pc][s2] ^ Zobrist::side;
@@ -159,7 +165,7 @@ void Position::init() {
                     }
                     count++;
                 }
-    assert(count == 3668);
+    assert(count > 3668);
 }
 
 
@@ -394,9 +400,9 @@ Position::set(const string& fenStr, bool isChess960, StateInfo* si) {
         {
             st->epSquare = make_square(File(col - 'a'), Rank(row - '1'));
 
-            Bitboard pawns = attacks_bb<PAWN>(st->epSquare, ~sideToMove) & pieces(sideToMove, PAWN);
+            Bitboard pawns =
+              Wrap::attacks_bb<PAWN>(st->epSquare, ~sideToMove) & pieces(sideToMove, PAWN);
             Bitboard target = (pieces(~sideToMove, PAWN) & (st->epSquare + pawn_push(~sideToMove)));
-            Bitboard occ    = pieces() ^ target ^ st->epSquare;
 
             // En passant square will be considered only if
             // a) side to move have a pawn threatening epSquare
@@ -405,10 +411,9 @@ Position::set(const string& fenStr, bool isChess960, StateInfo* si) {
             enpassant = pawns && target
                      && !(pieces() & (st->epSquare | (st->epSquare + pawn_push(sideToMove))));
 
-            // If no pawn can execute the en passant capture without leaving the king in check, don't record the epSquare
-            while (pawns)
-                legalEP |= !(attackers_to(square<KING>(sideToMove), occ ^ pop_lsb(pawns))
-                             & pieces(~sideToMove) & ~target);
+            // QuantumChess: like the QuantumChess engine and do_move(), the
+            // square is kept whenever a pawn attacks it, legal() checks the capture.
+            legalEP = true;
         }
         else
             return PositionSetError("Invalid FEN. Invalid en-passant square.");
@@ -470,10 +475,10 @@ void Position::set_check_info() const {
     update_slider_blockers(BLACK);
 
     Square ksq                              = square<KING>(~sideToMove);
-    const auto [bishopAttacks, rookAttacks] = both_attacks_bb(ksq, pieces());
+    const auto [bishopAttacks, rookAttacks] = Wrap::both_attacks_bb(ksq, pieces());
 
-    st->checkSquares[PAWN]   = attacks_bb<PAWN>(ksq, ~sideToMove);
-    st->checkSquares[KNIGHT] = attacks_bb<KNIGHT>(ksq);
+    st->checkSquares[PAWN]   = Wrap::attacks_bb<PAWN>(ksq, ~sideToMove);
+    st->checkSquares[KNIGHT] = Wrap::attacks_bb<KNIGHT>(ksq);
     st->checkSquares[BISHOP] = bishopAttacks;
     st->checkSquares[ROOK]   = rookAttacks;
     st->checkSquares[QUEEN]  = st->checkSquares[BISHOP] | st->checkSquares[ROOK];
@@ -618,21 +623,28 @@ void Position::update_slider_blockers(Color c) const {
     st->pinners[~c]        = 0;
 
     // Snipers are sliders that attack 's' when a piece and other snipers are removed
-    Bitboard snipers = ((attacks_bb<ROOK>(ksq) & pieces(QUEEN, ROOK))
-                        | (attacks_bb<BISHOP>(ksq) & pieces(QUEEN, BISHOP)))
+    Bitboard snipers = ((Wrap::attacks_bb<ROOK>(ksq) & pieces(QUEEN, ROOK))
+                        | (Wrap::attacks_bb<BISHOP>(ksq) & pieces(QUEEN, BISHOP)))
                      & pieces(~c);
     Bitboard occupancy = pieces() ^ snipers;
 
+    // QuantumChess: a sniper can reach the king along two paths, each of them
+    // with its own blocker.
     while (snipers)
     {
-        Square   sniperSq = pop_lsb(snipers);
-        Bitboard b        = between_bb(ksq, sniperSq) & occupancy;
+        Square             sniperSq = pop_lsb(snipers);
+        const Wrap::Paths& p        = Wrap::paths(ksq, sniperSq);
 
-        if (b && !more_than_one(b))
+        for (int i = 0; i < p.count; ++i)
         {
-            st->blockersForKing[c] |= b;
-            if (b & pieces(c))
-                st->pinners[~c] |= sniperSq;
+            Bitboard b = p.path[i] & occupancy;
+
+            if (b && !more_than_one(b))
+            {
+                st->blockersForKing[c] |= b;
+                if (b & pieces(c))
+                    st->pinners[~c] |= sniperSq;
+            }
         }
     }
 }
@@ -642,20 +654,22 @@ void Position::update_slider_blockers(Color c) const {
 // Slider attacks use the occupied bitboard to indicate occupancy.
 Bitboard Position::attackers_to(Square s, Bitboard occupied) const {
 
-    const auto [bishopAttacks, rookAttacks] = both_attacks_bb(s, occupied);
+    const auto [bishopAttacks, rookAttacks] = Wrap::both_attacks_bb(s, occupied);
 
     return (rookAttacks & pieces(ROOK, QUEEN)) | (bishopAttacks & pieces(BISHOP, QUEEN))
-         | (attacks_bb<PAWN>(s, BLACK) & pieces(WHITE, PAWN))
-         | (attacks_bb<PAWN>(s, WHITE) & pieces(BLACK, PAWN))
-         | (attacks_bb<KNIGHT>(s) & pieces(KNIGHT)) | (attacks_bb<KING>(s) & pieces(KING));
+         | (Wrap::attacks_bb<PAWN>(s, BLACK) & pieces(WHITE, PAWN))
+         | (Wrap::attacks_bb<PAWN>(s, WHITE) & pieces(BLACK, PAWN))
+         | (Wrap::attacks_bb<KNIGHT>(s) & pieces(KNIGHT))
+         | (Wrap::attacks_bb<KING>(s) & pieces(KING));
 }
 
 bool Position::attackers_to_exist(Square s, Bitboard occupied, Color c) const {
 
-    return (attacks_bb<ROOK>(s, occupied) & pieces(c, ROOK, QUEEN))
-        || (attacks_bb<BISHOP>(s, occupied) & pieces(c, BISHOP, QUEEN))
-        || (attacks_bb<PAWN>(s, ~c) & pieces(c, PAWN))
-        || (attacks_bb<KNIGHT>(s) & pieces(c, KNIGHT)) || (attacks_bb<KING>(s) & pieces(c, KING));
+    return (Wrap::attacks_bb<ROOK>(s, occupied) & pieces(c, ROOK, QUEEN))
+        || (Wrap::attacks_bb<BISHOP>(s, occupied) & pieces(c, BISHOP, QUEEN))
+        || (Wrap::attacks_bb<PAWN>(s, ~c) & pieces(c, PAWN))
+        || (Wrap::attacks_bb<KNIGHT>(s) & pieces(c, KNIGHT))
+        || (Wrap::attacks_bb<KING>(s) & pieces(c, KING));
 }
 
 // Tests whether a pseudo-legal move is legal
@@ -683,9 +697,11 @@ bool Position::legal(Move m) const {
             if (attackers_to_exist(s, pieces(), ~us))
                 return false;
 
-        // In case of Chess960, verify if the Rook blocks some checks.
-        // For instance an enemy queen in SQ_A1 when castling rook is in SQ_B1.
-        return !chess960 || !(blockers_for_king(us) & m.to_sq());
+        // QuantumChess: the rook leaving its corner can open a path through
+        // the edge to the king's destination, so check it after the move.
+        Square   rto = relative_square(us, to > from ? SQ_F1 : SQ_D1);
+        Bitboard occ = (pieces() ^ from ^ m.to_sq()) | to | rto;
+        return !attackers_to_exist(to, occ, ~us);
     }
 
     // If the moving piece is a king, check whether the destination square is
@@ -693,9 +709,18 @@ bool Position::legal(Move m) const {
     if (type_of(piece_on(from)) == KING)
         return !(attackers_to_exist(to, pieces() ^ from, ~us));
 
-    // A non-king move is legal if and only if it is not pinned or it
-    // is moving along the ray towards or away from the king.
-    return !(blockers_for_king(us) & from) || line_bb(from, to) & pieces(us, KING);
+    // QuantumChess: a non-pinned piece cannot expose its king, but with two
+    // paths per line "moving along the ray" is not enough for a pinned piece,
+    // and check evasions are generated from a superset of the blocking
+    // squares. Those cases (and en passant) are decided on the board after
+    // the move.
+    if (!checkers() && m.type_of() != EN_PASSANT && !(blockers_for_king(us) & from))
+        return true;
+
+    Square   capsq = m.type_of() == EN_PASSANT ? to - pawn_push(us) : to;
+    Bitboard occ   = (pieces() ^ from ^ capsq) | to;
+
+    return !(attackers_to(square<KING>(us), occ) & pieces(~us) & ~square_bb(capsq));
 }
 
 
@@ -735,7 +760,7 @@ bool Position::pseudo_legal(const Move m) const {
             return false;
 
         // Check if it's a valid capture, single push, or double push
-        const bool isCapture    = bool(attacks_bb<PAWN>(from, us) & pieces(~us) & to);
+        const bool isCapture    = bool(Wrap::attacks_bb<PAWN>(from, us) & pieces(~us) & to);
         const bool isSinglePush = (from + pawn_push(us) == to) && empty(to);
         const bool isDoublePush = (from + 2 * pawn_push(us) == to)
                                && (relative_rank(us, from) == RANK_2) && empty(to)
@@ -744,7 +769,7 @@ bool Position::pseudo_legal(const Move m) const {
         if (!(isCapture || isSinglePush || isDoublePush))
             return false;
     }
-    else if (!(attacks_bb(type_of(pc), from, pieces()) & to))
+    else if (!(Wrap::attacks_bb(type_of(pc), from, pieces()) & to))
         return false;
 
     if (checkers() && type_of(pc) != KING)
@@ -754,7 +779,7 @@ bool Position::pseudo_legal(const Move m) const {
             return false;
 
         // The move must block the check or capture the checker
-        if (!(between_bb(square<KING>(us), lsb(checkers())) & to))
+        if (!(Wrap::between_bb(square<KING>(us), lsb(checkers())) & to))
             return false;
     }
 
@@ -768,44 +793,49 @@ bool Position::gives_check(Move m) const {
     assert(m.is_ok());
     assert(color_of(moved_piece(m)) == sideToMove);
 
+    Color  us   = sideToMove;
     Square from = m.from_sq();
     Square to   = m.to_sq();
+    Square ksq  = square<KING>(~us);
+
+    // QuantumChess: with two paths per line, discovered checks are computed on
+    // the board after the move rather than with aligned squares.
+    auto slider_check = [&](Bitboard occupied, Bitboard rooks, Bitboard bishops) {
+        const auto [bishopAttacks, rookAttacks] = Wrap::both_attacks_bb(ksq, occupied);
+        return bool((rookAttacks & rooks) | (bishopAttacks & bishops));
+    };
+
+    // Castling is encoded as 'king captures the rook'. The king leaves its
+    // square and the rook its corner, either can open a line.
+    if (m.type_of() == CASTLING)
+    {
+        Square   kto = relative_square(us, to > from ? SQ_G1 : SQ_C1);
+        Square   rto = relative_square(us, to > from ? SQ_F1 : SQ_D1);
+        Bitboard occ = (pieces() ^ from ^ to) | kto | rto;
+
+        return slider_check(occ, (pieces(us, QUEEN, ROOK) ^ to) | rto, pieces(us, QUEEN, BISHOP));
+    }
 
     // Is there a direct check?
     if (check_squares(type_of(piece_on(from))) & to)
         return true;
 
-    // Is there a discovered check?
-    if (blockers_for_king(~sideToMove) & from)
-        return !(line_bb(from, to) & pieces(~sideToMove, KING)) || m.type_of() == CASTLING;
-
-    switch (m.type_of())
+    // Is there a discovered check? En passant also removes the captured pawn.
+    if ((blockers_for_king(~us) & from) || m.type_of() == EN_PASSANT)
     {
-    case NORMAL :
-        return false;
+        Bitboard occ = (pieces() ^ from) | to;
+        if (m.type_of() == EN_PASSANT)
+            occ ^= make_square(file_of(to), rank_of(from));
 
-    case PROMOTION :
-        return attacks_bb(m.promotion_type(), to, pieces() ^ from) & pieces(~sideToMove, KING);
-
-    // En passant capture with check? We have already handled the case of direct
-    // checks and ordinary discovered check, so the only case we need to handle
-    // is the unusual case of a discovered check through the captured pawn.
-    case EN_PASSANT : {
-        Square   capsq                          = make_square(file_of(to), rank_of(from));
-        Bitboard b                              = (pieces() ^ from ^ capsq) | to;
-        const auto [bishopAttacks, rookAttacks] = both_attacks_bb(square<KING>(~sideToMove), b);
-
-        return (rookAttacks & pieces(sideToMove, QUEEN, ROOK))
-             | (bishopAttacks & pieces(sideToMove, QUEEN, BISHOP));
+        if (slider_check(occ, pieces(us, QUEEN, ROOK) & ~square_bb(from),
+                         pieces(us, QUEEN, BISHOP) & ~square_bb(from)))
+            return true;
     }
-    default :  //CASTLING
-    {
-        // Castling is encoded as 'king captures the rook'
-        Square rto = relative_square(sideToMove, to > from ? SQ_F1 : SQ_D1);
 
-        return check_squares(ROOK) & rto;
-    }
-    }
+    if (m.type_of() == PROMOTION)
+        return Wrap::attacks_bb(m.promotion_type(), to, pieces() ^ from) & ksq;
+
+    return false;
 }
 
 
@@ -943,23 +973,15 @@ void Position::do_move(Move                      m,
         if ((int(to) ^ int(from)) == 16)
         {
             Square   epSquare = to - pawn_push(us);
-            Bitboard pawns    = attacks_bb<PAWN>(epSquare, us) & pieces(them, PAWN);
+            Bitboard pawns    = Wrap::attacks_bb<PAWN>(epSquare, us) & pieces(them, PAWN);
 
             // If there are no pawns attacking the ep square, ep is not possible.
+            // QuantumChess: like the QuantumChess engine, the square is set
+            // whenever a pawn attacks it, legal() checks the capture itself.
             if (pawns)
             {
-                Square   ksq         = square<KING>(them);
-                Bitboard notBlockers = ~st->previous->blockersForKing[them];
-                bool     noDiscovery = (from & notBlockers) || file_of(from) == file_of(ksq);
-
-                // If the pawn gives discovered check, ep is never legal. Else, if at least one
-                // pawn was not a blocker for the enemy king or lies on the same line as the
-                // enemy king and en passant square, a legal capture exists.
-                if (noDiscovery && (pawns & (notBlockers | line_bb(epSquare, ksq))))
-                {
-                    st->epSquare = epSquare;
-                    k ^= Zobrist::enpassant[file_of(epSquare)];
-                }
+                st->epSquare = epSquare;
+                k ^= Zobrist::enpassant[file_of(epSquare)];
             }
         }
 
@@ -1044,6 +1066,9 @@ void Position::do_move(Move                      m,
 
     // Calculate checkers bitboard (if move gives check)
     st->checkersBB = givesCheck ? attackers_to(square<KING>(them)) & pieces(us) : 0;
+
+    // QuantumChess: gives_check() is computed differently from upstream
+    assert(givesCheck == bool(attackers_to(square<KING>(them)) & pieces(us)));
 
     sideToMove = ~sideToMove;
 
@@ -1442,7 +1467,7 @@ bool Position::see_ge(Move m, int threshold) const {
                 break;
             occupied ^= least_significant_square_bb(bb);
 
-            attackers |= attacks_bb<BISHOP>(to, occupied) & pieces(BISHOP, QUEEN);
+            attackers |= Wrap::attacks_bb<BISHOP>(to, occupied) & pieces(BISHOP, QUEEN);
         }
 
         else if ((bb = stmAttackers & pieces(KNIGHT)))
@@ -1458,7 +1483,7 @@ bool Position::see_ge(Move m, int threshold) const {
                 break;
             occupied ^= least_significant_square_bb(bb);
 
-            attackers |= attacks_bb<BISHOP>(to, occupied) & pieces(BISHOP, QUEEN);
+            attackers |= Wrap::attacks_bb<BISHOP>(to, occupied) & pieces(BISHOP, QUEEN);
         }
 
         else if ((bb = stmAttackers & pieces(ROOK)))
@@ -1467,7 +1492,7 @@ bool Position::see_ge(Move m, int threshold) const {
                 break;
             occupied ^= least_significant_square_bb(bb);
 
-            attackers |= attacks_bb<ROOK>(to, occupied) & pieces(ROOK, QUEEN);
+            attackers |= Wrap::attacks_bb<ROOK>(to, occupied) & pieces(ROOK, QUEEN);
         }
 
         else if ((bb = stmAttackers & pieces(QUEEN)))
@@ -1477,7 +1502,7 @@ bool Position::see_ge(Move m, int threshold) const {
             assert(swap >= res);
             occupied ^= least_significant_square_bb(bb);
 
-            const auto [bishopAttacks, rookAttacks] = both_attacks_bb(to, occupied);
+            const auto [bishopAttacks, rookAttacks] = Wrap::both_attacks_bb(to, occupied);
             attackers |=
               (bishopAttacks & pieces(BISHOP, QUEEN)) | (rookAttacks & pieces(ROOK, QUEEN));
         }
@@ -1552,7 +1577,7 @@ bool Position::upcoming_repetition(int ply) const {
             Square s1   = move.from_sq();
             Square s2   = move.to_sq();
 
-            if (!((between_bb(s1, s2) ^ s2) & pieces()))
+            if (Wrap::path_clear(s1, s2, pieces()))
             {
                 if (ply > i)
                     return true;
@@ -1626,17 +1651,13 @@ bool Position::pos_is_ok() const {
 
     if (ep_square() != SQ_NONE)
     {
-        Square ksq = square<KING>(sideToMove);
-
+        // QuantumChess: the square is set whenever a pawn attacks it, even
+        // when the capture would leave the king in check.
         Bitboard captured = (ep_square() + pawn_push(~sideToMove)) & pieces(~sideToMove, PAWN);
-        Bitboard pawns    = attacks_bb<PAWN>(ep_square(), ~sideToMove) & pieces(sideToMove, PAWN);
-        Bitboard potentialCheckers = pieces(~sideToMove) ^ captured;
+        Bitboard pawns =
+          Wrap::attacks_bb<PAWN>(ep_square(), ~sideToMove) & pieces(sideToMove, PAWN);
 
-        if (!captured || !pawns
-            || ((attackers_to(ksq, pieces() ^ captured ^ ep_square() ^ lsb(pawns))
-                 & potentialCheckers)
-                && (attackers_to(ksq, pieces() ^ captured ^ ep_square() ^ msb(pawns))
-                    & potentialCheckers)))
+        if (!captured || !pawns)
             assert(0 && "pos_is_ok: En passant square");
     }
 

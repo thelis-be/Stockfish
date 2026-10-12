@@ -171,6 +171,9 @@ std::string engine_version_info() {
 #endif
     }
 
+    // QuantumChess: fork playing with wrapped files (see wrap.h)
+    ss << " QuantumChess";
+
     return ss.str();
 }
 

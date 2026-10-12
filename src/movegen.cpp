@@ -113,6 +113,14 @@ Move* generate_pawn_moves(const Position& pos, Move* moveList, Bitboard target) 
     constexpr Direction UpRight  = (Us == WHITE ? NORTH_EAST : SOUTH_WEST);
     constexpr Direction UpLeft   = (Us == WHITE ? NORTH_WEST : SOUTH_EAST);
 
+    // QuantumChess: a capture through the edge (from the h-file eastwards or
+    // the a-file westwards) is one rank away but seven files "back", so the
+    // offset between its squares differs by 8 from the usual one.
+    constexpr Bitboard  RightEdge   = (Us == WHITE ? FileHBB : FileABB);
+    constexpr Bitboard  LeftEdge    = (Us == WHITE ? FileABB : FileHBB);
+    constexpr Direction UpRightWrap = Direction(int(UpRight) + (Us == WHITE ? -8 : 8));
+    constexpr Direction UpLeftWrap  = Direction(int(UpLeft) + (Us == WHITE ? 8 : -8));
+
     const Bitboard emptySquares = ~pos.pieces();
     const Bitboard enemies      = Type == EVASIONS ? pos.checkers() : pos.pieces(Them);
 
@@ -138,9 +146,11 @@ Move* generate_pawn_moves(const Position& pos, Move* moveList, Bitboard target) 
     // Promotions and underpromotions
     if (pawnsOn7)
     {
-        Bitboard b1 = shift(pawnsOn7, UpRight) & enemies;
-        Bitboard b2 = shift(pawnsOn7, UpLeft) & enemies;
-        Bitboard b3 = shift(pawnsOn7, Up) & emptySquares;
+        Bitboard b1  = shift(pawnsOn7 & ~RightEdge, UpRight) & enemies;
+        Bitboard b2  = shift(pawnsOn7 & ~LeftEdge, UpLeft) & enemies;
+        Bitboard b1w = Wrap::shift(pawnsOn7 & RightEdge, UpRight) & enemies;
+        Bitboard b2w = Wrap::shift(pawnsOn7 & LeftEdge, UpLeft) & enemies;
+        Bitboard b3  = shift(pawnsOn7, Up) & emptySquares;
 
         if constexpr (Type == EVASIONS)
             b3 &= target;
@@ -151,6 +161,12 @@ Move* generate_pawn_moves(const Position& pos, Move* moveList, Bitboard target) 
         while (b2)
             moveList = make_promotions<Type, UpLeft, true>(moveList, pop_lsb(b2));
 
+        while (b1w)
+            moveList = make_promotions<Type, UpRightWrap, true>(moveList, pop_lsb(b1w));
+
+        while (b2w)
+            moveList = make_promotions<Type, UpLeftWrap, true>(moveList, pop_lsb(b2w));
+
         while (b3)
             moveList = make_promotions<Type, Up, false>(moveList, pop_lsb(b3));
     }
@@ -158,21 +174,26 @@ Move* generate_pawn_moves(const Position& pos, Move* moveList, Bitboard target) 
     // Standard and en passant captures
     if constexpr (Type == CAPTURES || Type == EVASIONS || Type == NON_EVASIONS)
     {
-        Bitboard b1 = shift(pawnsNotOn7, UpRight) & enemies;
-        Bitboard b2 = shift(pawnsNotOn7, UpLeft) & enemies;
+        Bitboard b1 = shift(pawnsNotOn7 & ~RightEdge, UpRight) & enemies;
+        Bitboard b2 = shift(pawnsNotOn7 & ~LeftEdge, UpLeft) & enemies;
 
         moveList = splat_pawn_moves<UpRight>(moveList, b1);
         moveList = splat_pawn_moves<UpLeft>(moveList, b2);
+
+        b1 = Wrap::shift(pawnsNotOn7 & RightEdge, UpRight) & enemies;
+        b2 = Wrap::shift(pawnsNotOn7 & LeftEdge, UpLeft) & enemies;
+
+        moveList = splat_pawn_moves<UpRightWrap>(moveList, b1);
+        moveList = splat_pawn_moves<UpLeftWrap>(moveList, b2);
 
         if (pos.ep_square() != SQ_NONE)
         {
             assert(rank_of(pos.ep_square()) == relative_rank(Us, RANK_6));
 
-            // An en passant capture cannot resolve a discovered check
-            if (Type == EVASIONS && (target & (pos.ep_square() + Up)))
-                return moveList;
-
-            b1 = pawnsNotOn7 & Attacks::attacks_bb<PAWN>(pos.ep_square(), Them);
+            // QuantumChess: the evasion target is a superset of the blocking
+            // squares, so en passant captures are always generated and
+            // Position::legal() decides.
+            b1 = pawnsNotOn7 & Wrap::attacks_bb<PAWN>(pos.ep_square(), Them);
 
             assert(b1);
 
@@ -195,7 +216,7 @@ Move* generate_moves(const Position& pos, Move* moveList, Bitboard target) {
     while (bb)
     {
         Square   from = pop_lsb(bb);
-        Bitboard b    = Attacks::attacks_bb<Pt>(from, pos.pieces()) & target;
+        Bitboard b    = Wrap::attacks_bb<Pt>(from, pos.pieces()) & target;
 
         moveList = splat_moves(moveList, from, b);
     }
@@ -215,7 +236,7 @@ Move* generate_all(const Position& pos, Move* moveList) {
     // Skip generating non-king moves when in double check
     if (Type != EVASIONS || !more_than_one(pos.checkers()))
     {
-        target = Type == EVASIONS     ? Attacks::between_bb(ksq, lsb(pos.checkers()))
+        target = Type == EVASIONS     ? Wrap::between_bb(ksq, lsb(pos.checkers()))
                : Type == NON_EVASIONS ? ~pos.pieces(Us)
                : Type == CAPTURES     ? pos.pieces(~Us)
                                       : ~pos.pieces();  // QUIETS
@@ -227,7 +248,7 @@ Move* generate_all(const Position& pos, Move* moveList) {
         moveList = generate_moves<Us, QUEEN>(pos, moveList, target);
     }
 
-    Bitboard b = Attacks::attacks_bb<KING>(ksq) & (Type == EVASIONS ? ~pos.pieces(Us) : target);
+    Bitboard b = Wrap::attacks_bb<KING>(ksq) & (Type == EVASIONS ? ~pos.pieces(Us) : target);
 
     moveList = splat_moves(moveList, ksq, b);
 
@@ -276,10 +297,13 @@ Move* generate<LEGAL>(const Position& pos, Move* moveList) {
     Square   ksq    = pos.square<KING>(us);
     Move*    cur    = moveList;
 
+    // QuantumChess: evasions come from a superset of the blocking squares,
+    // every one of them goes through legal().
     moveList =
       pos.checkers() ? generate<EVASIONS>(pos, moveList) : generate<NON_EVASIONS>(pos, moveList);
     while (cur != moveList)
-        if (((pinned & cur->from_sq()) || cur->from_sq() == ksq || cur->type_of() == EN_PASSANT)
+        if (((pinned & cur->from_sq()) || cur->from_sq() == ksq || cur->type_of() == EN_PASSANT
+             || pos.checkers())
             && !pos.legal(*cur))
             *cur = *(--moveList);
         else

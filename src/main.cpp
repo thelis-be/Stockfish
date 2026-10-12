@@ -25,6 +25,7 @@
 #include "position.h"
 #include "tune.h"
 #include "uci.h"
+#include "wrap.h"
 
 using namespace Stockfish;
 
@@ -40,6 +41,7 @@ int main(int argc, char* argv[]) {
     std::cout << engine_info() << std::endl;
 
     Attacks::init();
+    Wrap::init();  // QuantumChess: before Position::init(), which uses it
     Position::init();
 
     auto cli = CommandLine(argc, argv);
