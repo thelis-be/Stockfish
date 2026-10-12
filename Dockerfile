@@ -5,7 +5,7 @@
 #   /usr/local/bin/stockfish       official sf_19 release, linux-x86-64-universal (standard variant)
 #   /usr/local/bin/stockfish-wrap  this fork, built from src/ (QuantumChess variant, wrapped files)
 #
-#   docker build -t stockfish-quantumchess .
+#   docker build -t stockfish-quantumchess .     (default target: linux)
 #   docker run --rm -i stockfish-quantumchess          # UCI on stdin/stdout (wrap fork)
 #
 # The "windows" target exports the Windows builds for local development
@@ -63,7 +63,7 @@ COPY --from=official /out/stockfish.exe /
 COPY --from=build-windows /sf/src/stockfish-wrap.exe /
 COPY Copying.txt AUTHORS /
 
-FROM debian:trixie-slim
+FROM debian:trixie-slim AS linux
 COPY --from=official /out/stockfish /usr/local/bin/stockfish
 COPY --from=build-linux /sf/src/stockfish-wrap /usr/local/bin/stockfish-wrap
 COPY --chmod=644 Copying.txt AUTHORS /usr/share/doc/stockfish/
